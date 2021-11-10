@@ -1,0 +1,10 @@
+mongo_data/*
+certs/*
+data/*
+logs/*
+YYeTsFE/node_modules/*
+.github/*
+assets/*
+conf/*
+tests/*
+yyetsweb/yyets.sqlite
