@@ -7,18 +7,21 @@ __author__ = 'Benny <benny.think@gmail.com>'
 import io
 import json
 import logging
+import os
 import re
 import tempfile
 import time
 from urllib.parse import quote_plus
 
+import requests
 import telebot
+import zhconv
 from apscheduler.schedulers.background import BackgroundScheduler
 from telebot import apihelper, types
 from tgbot_ping import get_runtime
 
 import fansub
-from config import (FANSUB_ORDER, MAINTAINER, PROXY, REPORT, TOKEN,
+from config import (DOMAIN, FANSUB_ORDER, MAINTAINER, PROXY, REPORT, TOKEN,
                     YYETS_SEARCH_URL)
 from utils import (get_error_dump, redis_announcement, reset_request,
                    save_error_dump, show_usage, today_request)
@@ -31,17 +34,17 @@ bot = telebot.TeleBot(TOKEN, num_threads=100)
 angry_count = 0
 
 
-@bot.message_handler(commands=['start'])
+@bot.message_handler(commands=['start'], chat_types=['private'])
 def send_welcome(message):
     bot.send_chat_action(message.chat.id, 'typing')
     bot.send_message(message.chat.id, '欢迎使用，直接发送想要的剧集标题给我就可以了，不需要其他关键字，我会帮你搜索。\n\n'
-                                      '别说了，现在连流浪地球都搜得到了。本小可爱再也不生气了😄，'
+                                      '仅私聊使用，群组功能已禁用。'
                                       f'目前搜索优先级 {FANSUB_ORDER}\n '
                                       f'另外，可以尝试使用一下 https://yyets.dmesg.app/ 哦！',
                      parse_mode='html', disable_web_page_preview=True)
 
 
-@bot.message_handler(commands=['help'])
+@bot.message_handler(commands=['help'], chat_types=['private'])
 def send_help(message):
     bot.send_chat_action(message.chat.id, 'typing')
     bot.send_message(message.chat.id, '''机器人无法使用或者报错？从 /ping 里可以看到运行状态以及最新信息。
@@ -51,7 +54,7 @@ def send_help(message):
     3. <a href='https://t.me/mikuri520'>Telegram Channel</a>''', parse_mode='html', disable_web_page_preview=True)
 
 
-@bot.message_handler(commands=['ping'])
+@bot.message_handler(commands=['ping'], chat_types=['private'])
 def send_ping(message):
     logging.info("Pong!")
     bot.send_chat_action(message.chat.id, 'typing')
@@ -68,7 +71,7 @@ def send_ping(message):
                      parse_mode='markdown')
 
 
-@bot.message_handler(commands=['settings'])
+@bot.message_handler(commands=['settings'], chat_types=['private'])
 def settings(message):
     is_admin = str(message.chat.id) == MAINTAINER
     # 普通用户只可以查看，不可以设置。
@@ -106,7 +109,7 @@ def delete_announcement(call):
                           call.message.message_id)
 
 
-@bot.message_handler(commands=['credits'])
+@bot.message_handler(commands=['credits'], chat_types=['private'])
 def send_credits(message):
     bot.send_chat_action(message.chat.id, 'typing')
     bot.send_message(message.chat.id, '''感谢字幕组的无私奉献！本机器人资源来源:\n
@@ -119,7 +122,7 @@ def send_credits(message):
 
 for sub_name in dir(fansub):
     if sub_name.endswith("_offline") or sub_name.endswith("_online"):
-        @bot.message_handler(commands=[sub_name])
+        @bot.message_handler(commands=[sub_name], chat_types=['private'])
         def varies_fansub(message):
             bot.send_chat_action(message.chat.id, 'typing')
             # /YYeTsOffline 逃避可耻 /YYeTsOffline
@@ -128,7 +131,8 @@ for sub_name in dir(fansub):
             class_ = getattr(fansub, class_name)
 
             if not tv_name:
-                bot.send_message(message.chat.id, f"{class_.__name__}: 请附加你要搜索的剧集名称，如 `/{class_name} 逃避可耻`",
+                bot.send_message(message.chat.id,
+                                 f"{class_.__name__}: 请附加你要搜索的剧集名称，如 `/{class_name} 逃避可耻`",
                                  parse_mode='markdown')
                 return
 
@@ -172,13 +176,43 @@ def send_my_response(message):
     logging.info("Forward has been deleted.")
 
 
-@bot.message_handler(content_types=["photo", "text"])
+@bot.message_handler(content_types=["photo", "text"], chat_types=['private'])
 def send_search(message):
+    if str(message.chat.id) == os.getenv("SPECIAL_ID") and message.text == "❤️":
+        bot.reply_to(message, "❤️")
     # normal ordered search
     if message.text in ("Voice Chat started", "Voice Chat ended"):
         logging.warning("This is really funny %s", message.text)
         return
     base_send_search(message)
+
+
+@bot.message_handler(content_types=["document"], chat_types=['private'])
+def ban_user(message):
+    if str(message.chat.id) != MAINTAINER:
+        return
+
+    mem = io.BytesIO()
+    file_id = message.document.file_id
+    file_info = bot.get_file(file_id)
+    content = bot.download_file(file_info.file_path)
+    mem.write(content)
+    user_list = mem.getvalue().decode("u8").split("\n")
+    yy = fansub.YYeTsOffline()
+    client = yy.mongo
+    user_col = client["zimuzu"]["users"]
+    comment_col = client["zimuzu"]["comment"]
+    text = ""
+    for line in user_list:
+        user, reason = line.split(maxsplit=1)
+        ban = {"disable": True, "reason": reason}
+        user_col.update_one({"username": user}, {"$set": {"status": ban}})
+        comment_col.delete_many({"username": user})
+        status = f"{user} 已经被禁言，原因：{reason}\n"
+        logging.info("Banning %s", status)
+        text += status
+    bot.reply_to(message, text)
+    mem.close()
 
 
 def base_send_search(message, instance=None):
@@ -195,7 +229,7 @@ def base_send_search(message, instance=None):
         send_my_response(message)
         return
 
-    name = message.text
+    name = zhconv.convert(message.text, "zh-hans")
     logging.info('Receiving message: %s from user %s(%s)', name, message.chat.username, message.chat.id)
     if name is None:
         today_request("invalid")
@@ -269,48 +303,42 @@ def choose_link(call):
     if magic_recycle(fan, call, resource_url_hash):
         return
 
-    markup = types.InlineKeyboardMarkup()
-    # add class
-    btn1 = types.InlineKeyboardButton("分享页面", callback_data="share%s" % resource_url_hash)
-    btn2 = types.InlineKeyboardButton("我全都要", callback_data="all%s" % resource_url_hash)
-    markup.add(btn1, btn2)
-
-    text = "想要分享页面，还是我全都要？\n\n" \
-           "名词解释：“分享页面”会返回给你一个网站，从那里可以看到全部的下载链接。\n" \
-           "“我全都要”会给你发送一个txt文件，文件里包含全部下载连接\n"
-    bot.reply_to(call.message, text, reply_markup=markup)
-
-
-@bot.callback_query_handler(func=lambda call: re.findall(r"share(\S*)", call.data))
-def share_page(call):
-    fan = fansub.FansubEntrance()
-    # need class name as str
-    bot.send_chat_action(call.message.chat.id, 'typing')
-    resource_url_hash = re.findall(r"share(\S*)", call.data)[0]
-    if magic_recycle(fan, call, resource_url_hash):
-        return
-
     result = fan.search_result(resource_url_hash)
-    bot.send_message(call.message.chat.id, "{}  {}".format(result['cnname'], result['share']))
-
-
-@bot.callback_query_handler(func=lambda call: re.findall(r"all(\S*)", call.data))
-def all_episode(call):
-    # just send a file
-    fan = fansub.FansubEntrance()
-    bot.send_chat_action(call.message.chat.id, 'typing')
-    resource_url_hash = re.findall(r"all(\S*)", call.data)[0]
-    if magic_recycle(fan, call, resource_url_hash):
-        return
-
-    result = fan.search_result(resource_url_hash)
-    with tempfile.NamedTemporaryFile(mode='wb+', prefix=result["cnname"], suffix=".txt") as tmp:
+    with tempfile.NamedTemporaryFile(mode='wb+', prefix=result["cnname"].replace("/", " "), suffix=".txt") as tmp:
         bytes_data = json.dumps(result["all"], ensure_ascii=False, indent=4).encode('u8')
         tmp.write(bytes_data)
         tmp.flush()
         with open(tmp.name, "rb") as f:
+            if result.get("type") == "resource":
+                caption = "{}\n\n{}".format(result["cnname"], result["share"])
+            else:
+                caption = result["all"].replace(r"\n", "  ")
             bot.send_chat_action(call.message.chat.id, 'upload_document')
-            bot.send_document(call.message.chat.id, f, caption="%s" % result["cnname"])
+            bot.send_document(call.message.chat.id, f, caption=caption)
+
+
+@bot.callback_query_handler(func=lambda call: re.findall(r"approve", call.data))
+def approve_spam(call):
+    obj_id = re.findall(r"approve(\S*)", call.data)[0]
+    data = {
+        "obj_id": obj_id,
+        "token": TOKEN
+    }
+    requests.post(f"{DOMAIN}api/admin/spam", json=data)
+    bot.answer_callback_query(call.id, 'Approved')
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+
+
+@bot.callback_query_handler(func=lambda call: re.findall(r"ban", call.data))
+def ban_spam(call):
+    obj_id = re.findall(r"ban(\S*)", call.data)[0]
+    data = {
+        "obj_id": obj_id,
+        "token": TOKEN
+    }
+    requests.delete(f"{DOMAIN}api/admin/spam", json=data)
+    bot.answer_callback_query(call.id, 'Banned')
+    bot.delete_message(call.message.chat.id, call.message.message_id)
 
 
 @bot.callback_query_handler(func=lambda call: re.findall(r"unwelcome(\d*)", call.data))

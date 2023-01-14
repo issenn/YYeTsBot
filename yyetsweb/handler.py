@@ -12,6 +12,7 @@ import importlib
 import json
 import logging
 import os
+import pathlib
 import re
 import sys
 import time
@@ -22,14 +23,16 @@ from hashlib import sha1
 from http import HTTPStatus
 
 import filetype
+import zhconv
 from tornado import escape, gen, web
 from tornado.concurrent import run_on_executor
 
-from database import AntiCrawler, CaptchaResource, Redis
+from database import CaptchaResource, Redis
+from utils import Cloudflare
 
 escape.json_encode = lambda value: json.dumps(value, ensure_ascii=False)
 logging.basicConfig(level=logging.INFO)
-
+cf = Cloudflare()
 if getattr(sys, '_MEIPASS', None):
     adapter = "SQLite"
 else:
@@ -37,11 +40,71 @@ else:
 
 logging.info("%s Running with %s. %s", "#" * 10, adapter, "#" * 10)
 
-static_path = os.path.join(os.path.dirname(__file__), 'templates')
-index = os.path.join(static_path, "index.html")
+index = pathlib.Path(__file__).parent.joinpath("templates", "index.html").as_posix()
 
 
-class BaseHandler(web.RequestHandler):
+class SecurityHandler(web.RequestHandler):
+    key = "user_blacklist"
+
+    def __init__(self, application, request, **kwargs):
+        super().__init__(application, request, **kwargs)
+        self.r = Redis().r
+
+    def prepare(self):
+        if self.check_request():
+            self.set_status(HTTPStatus.FORBIDDEN)
+            self.finish()
+
+    def data_received(self, chunk):
+        pass
+
+    def check_request(self):
+        ban = self.__ip_check()
+        user = self.__user_check()
+        result = ban or user
+        if result:
+            self.ban()
+        return result
+
+    def get_real_ip(self):
+        x_real = self.request.headers.get("X-Real-IP")
+        remote_ip = self.request.remote_ip
+        logging.debug("X-Real-IP:%s, Remote-IP:%s", x_real, remote_ip)
+        return x_real or remote_ip
+
+    def ban(self):
+        ip = self.get_real_ip()
+        self.r.incr(ip)
+        count = int(self.r.get(ip))
+        # ban rule: (count-10)*600
+        if count <= 10:
+            ex = 120
+        else:
+            ex = (count - 10) * 600
+        if count >= 30:
+            cf.ban_new_ip(ip)
+        self.r.set(ip, count, ex)
+        user = self.get_current_user()
+        if user:
+            self.r.hincrby(self.key, user)
+
+    def get_current_user(self) -> str:
+        username = self.get_secure_cookie("username") or b""
+        return username.decode("u8")
+
+    def __user_check(self):
+        count = self.r.hget(self.key, self.get_current_user()) or 0
+        count = int(count)
+        if count >= 20:
+            return True
+
+    def __ip_check(self):
+        d = self.r.get(self.get_real_ip()) or 0
+        if int(d) >= 10:
+            return True
+
+
+class BaseHandler(SecurityHandler):
     executor = ThreadPoolExecutor(200)
     class_name = f"Fake{adapter}Resource"
     adapter_module = importlib.import_module(f"{adapter}")
@@ -55,17 +118,11 @@ class BaseHandler(web.RequestHandler):
 
     def write_error(self, status_code, **kwargs):
         if status_code in [HTTPStatus.FORBIDDEN,
-                           HTTPStatus.INTERNAL_SERVER_ERROR,
                            HTTPStatus.UNAUTHORIZED,
-                           HTTPStatus.NOT_FOUND]:
+                           HTTPStatus.NOT_FOUND,
+                           HTTPStatus.INTERNAL_SERVER_ERROR,
+                           ]:
             self.write(str(kwargs.get('exc_info')))
-
-    def data_received(self, chunk):
-        pass
-
-    def get_current_user(self) -> str:
-        username = self.get_secure_cookie("username") or b""
-        return username.decode("u8")
 
 
 class TopHandler(BaseHandler):
@@ -121,7 +178,7 @@ class UserHandler(BaseHandler):
         password = data["password"]
         captcha = data.get("captcha")
         captcha_id = data.get("captcha_id", "")
-        ip = AntiCrawler(self).get_real_ip()
+        ip = self.get_real_ip()
         browser = self.request.headers['user-agent']
 
         response = self.instance.login_user(username, password, captcha, captcha_id, ip, browser)
@@ -144,7 +201,8 @@ class UserHandler(BaseHandler):
         if username:
             data = self.instance.get_user_info(username)
         else:
-            self.set_status(HTTPStatus.UNAUTHORIZED)
+            # self.set_status(HTTPStatus.UNAUTHORIZED)
+            self.clear_cookie("username")
             data = {"message": "Please try to login"}
         return data
 
@@ -161,7 +219,7 @@ class UserHandler(BaseHandler):
         # everytime we receive a GET request to this api, we'll update last_date and last_ip
         username = self.get_current_user()
         if username:
-            now_ip = AntiCrawler(self).get_real_ip()
+            now_ip = self.get_real_ip()
             self.instance.update_user_last(username, now_ip)
 
     @gen.coroutine
@@ -179,20 +237,12 @@ class ResourceHandler(BaseHandler):
 
     @run_on_executor()
     def get_resource_data(self):
-        ban = AntiCrawler(self)
-        if ban.execute():
-            logging.warning("%s@%s make you happy:-(", self.request.headers.get("user-agent"), ban.get_real_ip())
-            self.set_status(HTTPStatus.FORBIDDEN)
-            return {}
-        else:
-            resource_id = int(self.get_query_argument("id"))
-            username = self.get_current_user()
-            data = self.instance.get_resource_data(resource_id, username)
 
+        resource_id = int(self.get_query_argument("id"))
+        username = self.get_current_user()
+        data = self.instance.get_resource_data(resource_id, username)
         if not data:
-            # not found, dangerous
-            ip = ban.get_real_ip()
-            ban.imprisonment(ip)
+            self.ban()
             self.set_status(HTTPStatus.NOT_FOUND)
             data = {}
 
@@ -201,6 +251,8 @@ class ResourceHandler(BaseHandler):
     @run_on_executor()
     def search_resource(self):
         kw = self.get_query_argument("keyword").lower()
+        # convert any text to zh-hans
+        kw = zhconv.convert(kw, "zh-hans")
         return self.instance.search_resource(kw)
 
     @gen.coroutine
@@ -356,7 +408,7 @@ class CommentHandler(BaseHandler):
         resource_id = int(self.get_argument("resource_id", "0"))
         size = int(self.get_argument("size", "5"))
         page = int(self.get_argument("page", "1"))
-        inner_size = int(self.get_argument("inner_size", "5"))
+        inner_size = int(self.get_argument("inner_size", "15"))
         inner_page = int(self.get_argument("inner_page", "1"))
         comment_id = self.get_argument("comment_id", None)
 
@@ -380,7 +432,7 @@ class CommentHandler(BaseHandler):
         resource_id = payload["resource_id"]
         comment_id = payload.get("comment_id")
 
-        real_ip = AntiCrawler(self).get_real_ip()
+        real_ip = self.get_real_ip()
         username = self.get_current_user()
         browser = self.request.headers['user-agent']
 
@@ -459,7 +511,7 @@ class CommentChildHandler(CommentHandler):
     @run_on_executor()
     def get_comment(self):
         parent_id = self.get_argument("parent_id", "0")
-        size = int(self.get_argument("size", "5"))
+        size = int(self.get_argument("size", "15"))
         page = int(self.get_argument("page", "1"))
 
         if not parent_id:
@@ -538,7 +590,7 @@ class AnnouncementHandler(BaseHandler):
 
         payload = self.json
         content = payload["content"]
-        real_ip = AntiCrawler(self).get_real_ip()
+        real_ip = self.get_real_ip()
         browser = self.request.headers['user-agent']
 
         self.instance.add_announcement(username, content, real_ip, browser)
@@ -713,6 +765,10 @@ class BlacklistHandler(BaseHandler):
 
 class NotFoundHandler(BaseHandler):
     def get(self):  # for react app
+        # if self.request.uri not in ["/", "/home", "/discuss", "/login", "/404", "/search",
+        #                             "/resource", "/me", "/database", "help", "/statistics"
+        #                             ]:
+        #     self.ban()
         self.render(index)
 
 
@@ -758,20 +814,20 @@ class DBDumpHandler(BaseHandler):
     @Redis.cache(3600)
     def get_hash(self):
         file_list = [
-            "templates/data/yyets_mongo.gz",
-            "templates/data/yyets_mysql.zip",
-            "templates/data/yyets_sqlite.zip"
+            "templates/dump/yyets_mongo.gz",
+            "templates/dump/yyets_mysql.zip",
+            "templates/dump/yyets_sqlite.zip"
         ]
         result = {}
         data = self.file_info(file_list)
         for file, value in data.items():
-            filename = os.path.basename(file)
+            filename = pathlib.Path(file).name
             result[filename] = {
                 "checksum": value[0],
                 "date": value[1],
                 "size": value[2],
             }
-
+        print(result)
         return result
 
     @gen.coroutine
@@ -902,8 +958,8 @@ class UserEmailHandler(BaseHandler):
 class CategoryHandler(BaseHandler):
     class_name = f"Category{adapter}Resource"
 
-    from Mongo import CategoryResource
-    instance = CategoryResource()
+    # from Mongo import CategoryResource
+    # instance = CategoryResource()
 
     @run_on_executor()
     def get_data(self):
@@ -917,3 +973,30 @@ class CategoryHandler(BaseHandler):
     def get(self):
         resp = yield self.get_data()
         self.write(resp)
+
+
+class SpamProcessHandler(BaseHandler):
+    class_name = f"SpamProcess{adapter}Resource"
+
+    # from Mongo import SpamProcessMongoResource
+    # instance = SpamProcessMongoResource()
+
+    def process(self, method):
+        obj_id = self.json.get("obj_id")
+        token = self.json.get("token")
+        ua = self.request.headers['user-agent']
+        ip = self.get_real_ip()
+        logging.info("Authentication %s(%s) for spam API now...", ua, ip)
+        if token == os.getenv("TOKEN"):
+            return getattr(self.instance, method)(obj_id)
+        else:
+            self.set_status(HTTPStatus.FORBIDDEN)
+            return {"status": False, "message": "This token is not allowed to access this API"}
+
+    @gen.coroutine
+    def post(self):
+        self.write(self.process("restore_spam"))
+
+    @gen.coroutine
+    def delete(self):
+        self.write(self.process("ban_spam"))

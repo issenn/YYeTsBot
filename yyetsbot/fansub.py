@@ -18,6 +18,7 @@ import pymongo
 import redis
 import requests
 from bs4 import BeautifulSoup
+from bson.objectid import ObjectId
 
 from config import (BD2020_SEARCH, FANSUB_ORDER, FIX_SEARCH, MONGO,
                     NEWZMZ_RESOURCE, NEWZMZ_SEARCH, REDIS, WORKERS,
@@ -172,7 +173,8 @@ class YYeTsOffline(BaseFansub):
     def __init__(self, db="zimuzu", col="yyets"):
         super().__init__()
         self.mongo = pymongo.MongoClient(host=MONGO)
-        self.collection = self.mongo[db][col]
+        self.db = self.mongo[db]
+        self.collection = self.db[col]
 
     @Redis.preview_cache(60)
     def search_preview(self, search_text: str) -> dict:
@@ -181,9 +183,9 @@ class YYeTsOffline(BaseFansub):
         projection = {'_id': False, 'data.info': True}
         data = self.collection.find({
             "$or": [
-                {"data.info.cnname": {"$regex": f".*{search_text}.*", "$options": "-i"}},
-                {"data.info.enname": {"$regex": f".*{search_text}.*", "$options": "-i"}},
-                {"data.info.aliasname": {"$regex": f".*{search_text}.*", "$options": "-i"}},
+                {"data.info.cnname": {"$regex": f".*{search_text}.*", "$options": "i"}},
+                {"data.info.enname": {"$regex": f".*{search_text}.*", "$options": "i"}},
+                {"data.info.aliasname": {"$regex": f".*{search_text}.*", "$options": "i"}},
             ]},
             projection
         )
@@ -199,18 +201,46 @@ class YYeTsOffline(BaseFansub):
                 "class": self.__class__.__name__
             }
 
-        logging.info("[%s] Offline search complete", self.__class__.__name__)
+        logging.info("[%s] Offline resource search complete", self.__class__.__name__)
+
+        comments = self.db["comment"].find({"content": {"$regex": f".*{search_text}.*", "$options": "i"}})
+        for c in comments:
+            url = "https://yyets.dmesg.app/resource.html?id={}#{}".format(c["resource_id"], str(c["_id"]))
+            url_hash = hashlib.sha1(url.encode('u8')).hexdigest()
+            all_name = c["content"]
+            results[url_hash] = {
+                "name": all_name,
+                "url": url,
+                "class": self.__class__.__name__
+            }
+        logging.info("[%s] Offline comment search complete", self.__class__.__name__)
+
         results["class"] = self.__class__.__name__
         return results
 
     @Redis.result_cache(10 * 60)
     def search_result(self, resource_url) -> dict:
         # yyets offline
-        # https://yyets.dmesg.app/resource.html?id=37089
-        rid = resource_url.split("id=")[1]
-        data: dict = self.collection.find_one({"data.info.id": int(rid)}, {'_id': False})
-        name = data["data"]["info"]["cnname"]
-        return {"all": json.dumps(data, ensure_ascii=False), "share": WORKERS.format(id=rid), "cnname": name}
+
+        # resource: https://yyets.dmesg.app/resource.html?id=37089
+        # comment: 'https://yyets.dmesg.app/resource.html?id=233#61893ae51e9152e43fa24124'
+        if "#" in resource_url:
+            cid = resource_url.split("#")[1]
+            data: dict = self.db["comment"].find_one(
+                {"_id": ObjectId(cid)},
+                {'_id': False, "ip": False, "type": False, "children": False, "browser": False}
+            )
+            share = resource_url
+            name = f"{data['username']} 的分享"
+            t = "comment"
+        else:
+            rid = resource_url.split("id=")[1]
+            data: dict = self.collection.find_one({"data.info.id": int(rid)}, {'_id': False})
+            name = data["data"]["info"]["cnname"]
+            share = WORKERS % rid
+            t = "resource"
+
+        return {"all": json.dumps(data, ensure_ascii=False, indent=4), "share": share, "cnname": name, "type": t}
 
     def __del__(self):
         self.mongo.close()
@@ -247,7 +277,7 @@ class ZimuxiaOnline(BaseFansub):
         html = self.get_html(resource_url)
         soup = BeautifulSoup(html, 'html.parser')
         cnname = soup.title.text.split("|")[0]
-        return {"all": html, "share": resource_url, "cnname": cnname}
+        return {"all": html, "share": resource_url, "cnname": cnname, "type": "resource"}
 
 
 class ZhuixinfanOnline(BaseFansub):
@@ -285,7 +315,7 @@ class ZhuixinfanOnline(BaseFansub):
         # 解析获得cnname等信息
         soup = BeautifulSoup(html, 'html.parser')
         cnname = soup.title.text.split("_")[0]
-        return {"all": html, "share": url, "cnname": cnname}
+        return {"all": html, "share": url, "cnname": cnname, "type": "resource"}
 
 
 class NewzmzOnline(BaseFansub):
@@ -316,7 +346,7 @@ class NewzmzOnline(BaseFansub):
         # 解析获得cnname等信息
         soup = BeautifulSoup(html, 'html.parser')
         cnname = soup.title.text.split("-")[0]
-        return {"all": html, "share": url, "cnname": cnname}
+        return {"all": html, "share": url, "cnname": cnname, "type": "resource"}
 
 
 class BD2020(NewzmzOnline):
@@ -375,7 +405,7 @@ class XL720(BD2020):
         html = self.get_html(url)
         soup = BeautifulSoup(html, 'html.parser')
         cnname = soup.title.text.split("迅雷下载")[0]
-        return {"all": html, "share": url, "cnname": cnname}
+        return {"all": html, "share": url, "cnname": cnname, "type": "resource"}
 
 
 class FansubEntrance(BaseFansub):
@@ -430,9 +460,9 @@ for sub_name in globals().copy():
         vars()[cmd_name] = m
 
 if __name__ == '__main__':
-    sub = BD2020()
-    search = sub.search_preview("我老婆要嫁人")
+    sub = ZimuxiaOnline()
+    search = sub.search_preview("最爱")
     print(search)
-    # uh = "a0702952077718cb9d1e08dca3485c51d5deee6e"
-    # result = sub.search_result(uh)
-    # print(json.dumps(result, ensure_ascii=False))
+    uh = "4bcd33af9be2fba0060c388e984c7a2509e7e654"
+    result = sub.search_result(uh)
+    print(json.dumps(result, ensure_ascii=False))

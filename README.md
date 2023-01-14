@@ -1,8 +1,7 @@
 # YYeTsBot
 
-[![Build Status](https://travis-ci.com/tgbot-collection/YYeTsBot.svg?branch=master)](https://travis-ci.com/tgbot-collection/YYeTsBot)
-
-[![codecov](https://codecov.io/gh/tgbot-collection/YYeTsBot/branch/master/graph/badge.svg?token=ZL1GCIF95D)](https://codecov.io/gh/tgbot-collection/YYeTsBot)
+[![build docker image](https://github.com/tgbot-collection/YYeTsBot/actions/workflows/builder.yaml/badge.svg)](https://github.com/tgbot-collection/YYeTsBot/actions/workflows/builder.yaml)
+[![Docker Pulls](https://img.shields.io/docker/pulls/bennythink/yyetsbot)](https://hub.docker.com/r/bennythink/yyetsbot)
 
 * 人人影视bot，[戳我使用](https://t.me/yyets_bot)
 
@@ -87,14 +86,11 @@ yyets_offline - 人人影视离线数据
 
 ## 一键运行包
 
-这个版本使用起来也很简单，无依赖。步骤如下
+这个版本使用起来也很简单，也同样是最新的UI，只不过只有最基础的搜索功能。步骤如下
 
-1. 请到 [GitHub Release](https://github.com/tgbot-collection/YYeTsBot/releases) 根据自己平台下载一键运行包
-2. 请到 [database download](https://yyets.dmesg.app/database) 下载SQLite数据库，然后解压缩
-3. 把这两个文件放到同一个目录，结构如下 `yyets.sqlite yyetsweb`
-4. windows：双击第一步下载的文件； macos/Linux，cd到你的目录, `chmod +x yyetsweb ; ./yyetsweb`
-
-打开浏览器 http://127.0.0.1:8888 就可以看到熟悉的搜索界面啦！
+1. 请到 [GitHub Release](https://github.com/tgbot-collection/YYeTsBot/releases) 根据自己平台下载最新的一键运行包
+2. windows：双击第一步下载的exe文件； macos/Linux，cd到你的目录, `chmod +x yyetsweb ; ./yyetsweb`
+3. 程序会自动下载数据库并启动。等到出现启动banner时， 打开浏览器 http://127.0.0.1:8888 就可以看到熟悉的搜索界面啦！
 
 # 开发
 
@@ -150,6 +146,10 @@ yyets_offline - 人人影视离线数据
 * [Telegram Channel](https://t.me/mikuri520)
 * 捐助我，[给我买杯咖啡？](https://www.buymeacoffee.com/bennythink)
 * 捐助我，[爱发电？](https://afdian.net/@BennyThink)
+* 捐助我，[GitHub Sponsor](https://github.com/sponsors/BennyThink)
+* 捐助我，[Stripe](https://buy.stripe.com/dR67vU4p13Ox73a6oq)
+
+ <img src="./assets/CNY.png" width = 30%  alt="stripe"  />
 
 # 感谢
 

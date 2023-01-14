@@ -9,36 +9,40 @@ __author__ = "Benny <benny.think@gmail.com>"
 
 import logging
 import os
+import pathlib
 import platform
+import threading
 
 import pytz
 import tornado.autoreload
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from tornado import httpserver, ioloop, options, web
 from tornado.log import enable_pretty_logging
 
+import dump_db
+from Mongo import OtherMongoResource, ResourceLatestMongoResource
 from handler import (AnnouncementHandler, BlacklistHandler, CaptchaHandler,
                      CategoryHandler, CommentChildHandler, CommentHandler,
                      CommentNewestHandler, CommentReactionHandler,
-                      DBDumpHandler, DoubanHandler,
-                     DoubanReportHandler, GrafanaIndexHandler,
-                     GrafanaQueryHandler, GrafanaSearchHandler, IndexHandler,
-                     LikeHandler, MetricsHandler, NameHandler, NotFoundHandler,
+                     DBDumpHandler, DoubanHandler, DoubanReportHandler,
+                     GrafanaIndexHandler, GrafanaQueryHandler,
+                     GrafanaSearchHandler, IndexHandler, LikeHandler,
+                     MetricsHandler, NameHandler, NotFoundHandler,
                      NotificationHandler, ResourceHandler,
-                     ResourceLatestHandler, TopHandler, UserEmailHandler,
-                     UserHandler)
+                     ResourceLatestHandler, SpamProcessHandler, TopHandler,
+                     UserEmailHandler, UserHandler)
 from migration.douban_sync import sync_douban
-from Mongo import OtherMongoResource, ResourceLatestMongoResource
+from utils import Cloudflare
 
 enable_pretty_logging()
-
+cf = Cloudflare()
 if os.getenv("debug"):
     logging.basicConfig(level=logging.DEBUG)
 
 
 class RunServer:
-    root_path = os.path.dirname(__file__)
-    static_path = os.path.join(root_path, 'templates')
+    static_path = pathlib.Path(__file__).parent.joinpath('templates')
     handlers = [
         (r'/', IndexHandler),
         (r'/api/resource', ResourceHandler),
@@ -64,6 +68,7 @@ class RunServer:
         (r'/api/douban/report', DoubanReportHandler),
         (r'/api/notification', NotificationHandler),
         (r'/api/category', CategoryHandler),
+        (r'/api/admin/spam', SpamProcessHandler),
 
         (r'/(.*\.html|.*\.js|.*\.css|.*\.png|.*\.jpg|.*\.ico|.*\.gif|.*\.woff2|.*\.gz|.*\.zip|'
          r'.*\.svg|.*\.json|.*\.txt)',
@@ -98,10 +103,16 @@ class RunServer:
 if __name__ == "__main__":
     timez = pytz.timezone('Asia/Shanghai')
     scheduler = BackgroundScheduler(timezone=timez)
-    scheduler.add_job(OtherMongoResource().reset_top, 'cron', hour=0, minute=0, day=1)
-    scheduler.add_job(sync_douban, 'cron', hour=0, minute=0, day=1)
-    scheduler.add_job(ResourceLatestMongoResource().refresh_latest_resource, 'cron', hour=1)
+    scheduler.add_job(OtherMongoResource().reset_top, trigger=CronTrigger.from_crontab("0 0 1 * *"))
+    scheduler.add_job(sync_douban, trigger=CronTrigger.from_crontab("1 1 1 * *"))
+    scheduler.add_job(dump_db.entry_dump, trigger=CronTrigger.from_crontab("2 2 1 * *"))
+    scheduler.add_job(ResourceLatestMongoResource().refresh_latest_resource, 'interval', hours=1)
+    scheduler.add_job(OtherMongoResource().import_ban_user, 'interval', seconds=300)
+    scheduler.add_job(cf.clear_fw, trigger=CronTrigger.from_crontab("0 0 */5 * *"))
     scheduler.start()
+    logging.info("Triggering dump database now...")
+    threading.Thread(target=dump_db.entry_dump).start()
+
     options.define("p", default=8888, help="running port", type=int)
     options.define("h", default='127.0.0.1', help="listen address", type=str)
     options.parse_command_line()

@@ -37,7 +37,7 @@ from database import (AnnouncementResource, BlacklistResource, CaptchaResource,
                       NameResource, NotificationResource, OtherResource, Redis,
                       ResourceLatestResource, ResourceResource, TopResource,
                       UserEmailResource, UserResource)
-from utils import send_mail, ts_date
+from utils import Cloudflare, check_spam, send_mail, ts_date
 
 lib_path = pathlib.Path(__file__).parent.parent.joinpath("yyetsbot").resolve().as_posix()
 sys.path.append(lib_path)
@@ -46,6 +46,7 @@ from fansub import BD2020, XL720, NewzmzOnline, ZhuixinfanOnline, ZimuxiaOnline
 mongo_host = os.getenv("mongo") or "localhost"
 DOUBAN_SEARCH = "https://www.douban.com/search?cat=1002&q={}"
 DOUBAN_DETAIL = "https://movie.douban.com/subject/{}/"
+cf = Cloudflare()
 
 
 class Mongo:
@@ -61,6 +62,11 @@ class Mongo:
         data = self.db["users"].find_one({"username": username, "group": {"$in": ["admin"]}})
         if data:
             return True
+
+    def is_user_blocked(self, username: str) -> str:
+        r = self.db["users"].find_one({"username": username, "status.disable": True})
+        if r:
+            return r["status"]["reason"]
 
 
 class FakeMongoResource:
@@ -86,6 +92,16 @@ class OtherMongoResource(OtherResource, Mongo):
         self.db["history"].insert_one(result)
         # reset
         self.db["yyets"].update_many({}, {"$set": {"data.info.views": 0}})
+
+    def import_ban_user(self):
+        # TODO ban IP as well?
+        usernames = self.db["users"].find({"status.disable": True}, projection={"username": True})
+        r = Redis().r
+        r.delete("user_blacklist")
+        logging.info("Importing ban users to redis...%s", usernames)
+        for username in [u["username"] for u in usernames]:
+            r.hset("user_blacklist", username, 100)
+        r.close()
 
 
 class AnnouncementMongoResource(AnnouncementResource, Mongo):
@@ -165,7 +181,7 @@ class CommentMongoResource(CommentResource, Mongo):
     def get_user_group(self, data):
         for comment in data:
             username = comment["username"]
-            user = self.db["users"].find_one({"username": username})
+            user = self.db["users"].find_one({"username": username}) or {}
             group = user.get("group", ["user"])
             comment["group"] = group
 
@@ -206,6 +222,24 @@ class CommentMongoResource(CommentResource, Mongo):
     def add_comment(self, captcha: str, captcha_id: int, content: str, resource_id: int,
                     ip: str, username: str, browser: str, parent_comment_id=None) -> dict:
         returned = {"status_code": 0, "message": ""}
+        # check if this user is blocked
+        reason = self.is_user_blocked(username)
+        if reason:
+            return {"status_code": HTTPStatus.FORBIDDEN, "message": reason}
+        if check_spam(ip, browser, username, content) != 0:
+            document = {
+                "username": username,
+                "ip": ip,
+                "date": ts_date(),
+                "browser": browser,
+                "content": content,
+                "resource_id": resource_id
+            }
+            inserted_id = self.db["spam"].insert_one(document).inserted_id
+            document["_id"] = str(inserted_id)
+            SpamProcessMongoResource.request_approval(document)
+            return {"status_code": HTTPStatus.FORBIDDEN, "message": f"possible spam, reference id: {inserted_id}"}
+
         user_group = self.db["users"].find_one(
             {"username": username},
             projection={"group": True, "_id": False}
@@ -392,7 +426,7 @@ class CommentNewestMongoResource(CommentNewestResource, CommentMongoResource, Mo
 class CommentSearchMongoResource(CommentNewestMongoResource):
 
     def get_comment(self, page: int, size: int, keyword="") -> dict:
-        self.condition.update(content={'$regex': f'.*{keyword}.*', "$options": "-i"})
+        self.condition.update(content={'$regex': f'.*{keyword}.*', "$options": "i"})
         return super(CommentSearchMongoResource, self).get_comment(page, size, keyword)
 
     def extra_info(self, data):
@@ -484,7 +518,8 @@ class ResourceMongoResource(ResourceResource, Mongo):
             {"data.info.id": resource_id},
             {'$inc': {'data.info.views': 1}},
             {'_id': False})
-
+        if not data:
+            return {}
         if username:
             user_like_data = self.db["users"].find_one({"username": username})
             if user_like_data and resource_id in user_like_data.get("like", []):
@@ -494,6 +529,8 @@ class ResourceMongoResource(ResourceResource, Mongo):
         return data
 
     def search_resource(self, keyword: str) -> dict:
+        order = os.getenv("ORDER") or 'YYeTsOffline,ZimuxiaOnline,NewzmzOnline,ZhuixinfanOnline,XL720,BD2020'.split(",")
+        order.pop(0)
         final = []
         returned = {}
 
@@ -503,9 +540,9 @@ class ResourceMongoResource(ResourceResource, Mongo):
 
         resource_data = self.db["yyets"].find({
             "$or": [
-                {"data.info.cnname": {'$regex': f'.*{keyword}.*', "$options": "-i"}},
-                {"data.info.enname": {'$regex': f'.*{keyword}.*', "$options": "-i"}},
-                {"data.info.aliasname": {'$regex': f'.*{keyword}.*', "$options": "-i"}},
+                {"data.info.cnname": {'$regex': f'.*{keyword}.*', "$options": "i"}},
+                {"data.info.enname": {'$regex': f'.*{keyword}.*', "$options": "i"}},
+                {"data.info.aliasname": {'$regex': f'.*{keyword}.*', "$options": "i"}},
             ]},
             projection
         )
@@ -520,27 +557,29 @@ class ResourceMongoResource(ResourceResource, Mongo):
         for c in r.get("data", []):
             comment_rid = c["resource_id"]
             d = self.db["yyets"].find_one({"data.info.id": comment_rid}, projection={"data.info": True})
-            c_search.append(
-                {
-                    "username": c["username"],
-                    "date": c["date"],
-                    "comment": c["content"],
-                    "commentID": c["id"],
-                    "resourceID": comment_rid,
-                    "resourceName": d["data"]["info"]["cnname"],
-                    "origin": "comment"
-                }
-            )
+            if d:
+                c_search.append(
+                    {
+                        "username": c["username"],
+                        "date": c["date"],
+                        "comment": c["content"],
+                        "commentID": c["id"],
+                        "resourceID": comment_rid,
+                        "resourceName": d["data"]["info"]["cnname"],
+                        "origin": "comment"
+                    }
+                )
 
         if final:
             returned = dict(data=final)
             returned["extra"] = []
         else:
-            extra = self.fansub_search(ZimuxiaOnline.__name__, keyword) or \
-                    self.fansub_search(NewzmzOnline.__name__, keyword) or \
-                    self.fansub_search(ZhuixinfanOnline.__name__, keyword) or \
-                    self.fansub_search(XL720.__name__, keyword) or \
-                    self.fansub_search(BD2020.__name__, keyword)
+            extra = []
+            with contextlib.suppress(requests.exceptions.RequestException):
+                for name in order:
+                    extra = self.fansub_search(name, keyword)
+                    if extra:
+                        break
 
             returned["data"] = []
             returned["extra"] = extra
@@ -629,13 +668,12 @@ class TopMongoResource(TopResource, Mongo):
 
     def get_top_resource(self) -> dict:
         area_dict = dict(ALL={"$regex": ".*"}, US="美国", JP="日本", KR="韩国", UK="英国")
-        all_data = {}
+        all_data = {"ALL": "全部"}
         for abbr, area in area_dict.items():
             data = self.db["yyets"].find({"data.info.area": area, "data.info.id": {"$ne": 233}}, self.projection). \
                 sort("data.info.views", pymongo.DESCENDING).limit(15)
             all_data[abbr] = list(data)
 
-        area_dict["ALL"] = "全部"
         all_data["class"] = area_dict
         return all_data
 
@@ -697,6 +735,9 @@ class UserMongoResource(UserResource, Mongo):
                 returned_value["message"] = "用户名或密码错误"
 
         else:
+            if os.getenv("DISABLE_REGISTER"):
+                return {"status_code": HTTPStatus.BAD_REQUEST, "message": "本站已经暂停注册"}
+
             # register
             hash_value = pbkdf2_sha256.hash(password)
             try:
@@ -800,7 +841,7 @@ class DoubanMongoResource(DoubanResource, Mongo):
         douban_item = soup.find_all("div", class_="content")
 
         fwd_link = unquote(douban_item[0].a["href"])
-        douban_id = re.findall(r"https://movie.douban.com/subject/(\d*)/&query=", fwd_link)[0]
+        douban_id = re.findall(r"https://movie\.douban\.com/subject/(\d*)/.*", fwd_link)[0]
         final_data = self.get_craw_data(cname, douban_id, resource_id, search_html, session)
         douban_col.insert_one(final_data.copy())
         final_data.pop("raw")
@@ -888,7 +929,13 @@ class NotificationMongoResource(NotificationResource, Mongo):
         # .sort("_id", pymongo.DESCENDING).limit(size).skip((page - 1) * size)
         notify = self.db["notification"].find_one({"username": username}, projection={"_id": False})
         if not notify:
-            return {}
+            return {
+                "username": username,
+                "unread_item": [],
+                "read_item": [],
+                "unread_count": 0,
+                "read_count": 0
+            }
 
         # size is shared
         unread = notify.get("unread", [])
@@ -1016,7 +1063,7 @@ class ResourceLatestMongoResource(ResourceLatestResource, Mongo):
         col = self.db["yyets"]
         projection = {"_id": False, "status": False, "info": False}
         episode_data = {}
-        for res in tqdm(col.find(projection=projection), total=col.count()):
+        for res in tqdm(col.find(projection=projection), total=col.count_documents({})):
             for season in res["data"].get("list", []):
                 for item in season["items"].values():
                     for single in item:
@@ -1042,3 +1089,52 @@ class ResourceLatestMongoResource(ResourceLatestResource, Mongo):
         latest = self.query_db()
         redis.set("latest-resource", json.dumps(latest, ensure_ascii=False))
         logging.info("latest-resource data refreshed.")
+
+
+class SpamProcessMongoResource(Mongo):
+
+    def ban_spam(self, obj_id: "str"):
+        obj_id = ObjectId(obj_id)
+        logging.info("Deleting spam %s", obj_id)
+        spam = self.db["spam"].find_one({"_id": obj_id})
+        username = spam["username"]
+        self.db["spam"].delete_many({"username": username})
+        # TODO disable it for now
+        # self.db["comment"].delete_many({"username": username})
+        cf.ban_new_ip(spam["ip"])
+        return {"status": True}
+
+    def restore_spam(self, obj_id: "str"):
+        obj_id = ObjectId(obj_id)
+        spam = self.db["spam"].find_one({"_id": obj_id}, projection={"_id": False})
+        logging.info("Restoring spam %s", spam)
+        self.db["comment"].insert_one(spam)
+        self.db["spam"].delete_one({"_id": obj_id})
+        return {"status": True}
+
+    @staticmethod
+    def request_approval(document: "dict"):
+        token = os.getenv("TOKEN")
+        owner = os.getenv("OWNER")
+        obj_id = document["_id"]
+        data = {
+            "text": json.dumps(document, ensure_ascii=False, indent=4),
+            "chat_id": owner,
+            "reply_markup": {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "approve",
+                            "callback_data": f"approve{obj_id}"
+                        },
+                        {
+                            "text": "ban",
+                            "callback_data": f"ban{obj_id}"
+                        }
+                    ]
+                ]
+            }
+        }
+        api = f"https://api.telegram.org/bot{token}/sendMessage"
+        resp = requests.post(api, json=data).json()
+        logging.info("Telegram response: %s", resp)
